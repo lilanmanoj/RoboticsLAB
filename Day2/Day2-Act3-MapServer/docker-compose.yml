@@ -1,0 +1,15 @@
+services:
+  mapserver:
+    build: .
+    image: ea3121/tof-mapserver:1.0
+    container_name: tof-mapserver
+    restart: unless-stopped
+
+    # Published on all interfaces. The robot posts to this machine's
+    # address on the GA25LM network, so binding to 127.0.0.1 would
+    # make the server invisible to it.
+    ports:
+      - "8080:8080"
+
+    environment:
+      MAP_PORT: "8080"

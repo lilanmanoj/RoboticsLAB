@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2D ToF Map</title>
+<style>
+  :root {
+    --bg:        #0d1117;
+    --panel:     #161b22;
+    --line:      #30363d;
+    --text:      #e6edf3;
+    --muted:     #8b949e;
+    --accent:    #2f81f7;
+    --hit:       #f0883e;
+    --ok:        #3fb950;
+    --stale:     #d29922;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+
+  h1 { font-size: 15px; margin: 0; letter-spacing: .04em; }
+  header .sub { color: var(--muted); font-size: 12px; }
+
+  #status {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  #dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--muted);
+  }
+  #dot.live   { background: var(--ok);    box-shadow: 0 0 8px var(--ok); }
+  #dot.stale  { background: var(--stale); }
+  #dot.down   { background: #f85149; }
+
+  main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 240px;
+    gap: 16px;
+    padding: 16px 18px;
+    align-items: start;
+  }
+
+  @media (max-width: 760px) {
+    main { grid-template-columns: minmax(0, 1fr); }
+  }
+
+  #wrap {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px;
+  }
+
+  canvas { width: 100%; height: auto; display: block; }
+
+  aside {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 14px;
+  }
+
+  aside h2 {
+    font-size: 11px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 10px;
+    font-weight: 600;
+  }
+
+  .stat { display: flex; justify-content: space-between; gap: 8px; padding: 3px 0; }
+  .stat span:first-child { color: var(--muted); }
+
+  hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
+
+  label.row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  input[type=checkbox] { accent-color: var(--accent); }
+
+  button {
+    width: 100%;
+    margin-top: 8px;
+    padding: 7px 10px;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text);
+    background: #21262d;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+
+  .hint { color: var(--muted); font-size: 11px; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>2D ToF MAP</h1>
+  <span class="sub">VL53L0X &middot; 360&deg; polar scan</span>
+  <div id="status"><span id="dot"></span><span id="statusText">waiting for scan&hellip;</span></div>
+</header>
+
+<main>
+  <div id="wrap"><canvas id="map"></canvas></div>
+
+  <aside>
+    <h2>Scan</h2>
+    <div class="stat"><span>id</span><span id="sScan">&mdash;</span></div>
+    <div class="stat"><span>points</span><span id="sPoints">&mdash;</span></div>
+    <div class="stat"><span>hits</span><span id="sHits">&mdash;</span></div>
+    <div class="stat"><span>nearest</span><span id="sNear">&mdash;</span></div>
+    <div class="stat"><span>furthest</span><span id="sFar">&mdash;</span></div>
+    <div class="stat"><span>updated</span><span id="sAge">&mdash;</span></div>
+
+    <hr>
+
+    <h2>View</h2>
+    <div class="stat"><span>range</span><span id="sRange">2.0 m</span></div>
+    <input id="zoom" type="range" min="500" max="4000" step="100" value="2000">
+
+    <label class="row"><input id="optWalls" type="checkbox" checked> join adjacent hits</label>
+    <label class="row"><input id="optRays"  type="checkbox"> show beam rays</label>
+    <label class="row"><input id="optLabels" type="checkbox" checked> ring labels</label>
+
+    <button id="btnClear">clear map</button>
+
+    <p class="hint">
+      0&deg; is straight ahead of the robot; bearings increase
+      clockwise. Gaps are bearings where the beam found no return
+      within range.
+    </p>
+  </aside>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  const canvas = document.getElementById("map");
+  const ctx    = canvas.getContext("2d");
+
+  const el = id => document.getElementById(id);
+  const ui = {
+    dot: el("dot"), statusText: el("statusText"),
+    scan: el("sScan"), points: el("sPoints"), hits: el("sHits"),
+    near: el("sNear"), far: el("sFar"), age: el("sAge"),
+    range: el("sRange"), zoom: el("zoom"),
+    walls: el("optWalls"), rays: el("optRays"), labels: el("optLabels"),
+    clear: el("btnClear")
+  };
+
+  let scan = null;          // last payload from /api/map
+  let failures = 0;         // consecutive failed polls
+
+  // Two adjacent hits are joined into a wall segment only if their
+  // ranges are within this much. Without the test, the line jumps
+  // across a doorway and draws a wall where the gap is.
+  const WALL_JOIN_MM = 350;
+
+  // ----------------------------------------------------------
+  // canvas sizing - square, and sharp on hidpi screens
+  // ----------------------------------------------------------
+  function resize() {
+    const dpr  = window.devicePixelRatio || 1;
+    const wrap = canvas.parentElement;
+    const size = Math.max(280, Math.min(wrap.clientWidth - 16, 720));
+
+    canvas.style.width  = size + "px";
+    canvas.style.height = size + "px";
+    canvas.width  = Math.round(size * dpr);
+    canvas.height = Math.round(size * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    draw();
+  }
+
+  // ----------------------------------------------------------
+  // drawing
+  // ----------------------------------------------------------
+  function draw() {
+    const w  = canvas.clientWidth;
+    const h  = canvas.clientHeight;
+    const cx = w / 2;
+    const cy = h / 2;
+
+    const rangeMm = Number(ui.zoom.value);
+    const scale   = (Math.min(w, h) / 2 - 26) / rangeMm;   // px per mm
+
+    ctx.clearRect(0, 0, w, h);
+
+    drawGrid(cx, cy, rangeMm, scale);
+
+    if (scan && scan.points && scan.points.length) {
+      if (ui.rays.checked)  drawRays(cx, cy, scale, rangeMm);
+      if (ui.walls.checked) drawWalls(cx, cy, scale);
+      drawPoints(cx, cy, scale);
+    }
+
+    drawRobot(cx, cy);
+  }
+
+  function polar(cx, cy, bearingDeg, distMm, scale) {
+    const a = bearingDeg * Math.PI / 180;
+    return [cx + Math.sin(a) * distMm * scale,
+            cy - Math.cos(a) * distMm * scale];
+  }
+
+  function drawGrid(cx, cy, rangeMm, scale) {
+    const style = getComputedStyle(document.documentElement);
+    const line  = style.getPropertyValue("--line").trim();
+    const muted = style.getPropertyValue("--muted").trim();
+
+    // Range rings every 0.5 m, labelled in metres
+    ctx.strokeStyle = line;
+    ctx.lineWidth = 1;
+    ctx.font = "10px ui-monospace, monospace";
+    ctx.fillStyle = muted;
+
+    for (let r = 500; r <= rangeMm; r += 500) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * scale, 0, Math.PI * 2);
+      ctx.stroke();
+
+      if (ui.labels.checked) {
+        ctx.fillText((r / 1000).toFixed(1) + " m", cx + 4, cy - r * scale - 3);
+      }
+    }
+
+    // Bearing spokes every 30 degrees
+    for (let a = 0; a < 360; a += 30) {
+      const [x, y] = polar(cx, cy, a, rangeMm, scale);
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(x, y);
+      ctx.globalAlpha = (a % 90 === 0) ? 0.55 : 0.25;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // Cardinal labels, robot-relative
+    if (ui.labels.checked) {
+      ctx.fillStyle = muted;
+      ctx.textAlign = "center";
+      const r = rangeMm * scale + 14;
+      ctx.fillText("0° fwd", cx, cy - r + 4);
+      ctx.fillText("90°",    cx + r - 6, cy + 4);
+      ctx.fillText("180°",   cx, cy + r - 2);
+      ctx.fillText("270°",   cx - r + 8, cy + 4);
+      ctx.textAlign = "left";
+    }
+  }
+
+  function drawRays(cx, cy, scale, rangeMm) {
+    const style = getComputedStyle(document.documentElement);
+    ctx.strokeStyle = style.getPropertyValue("--accent").trim();
+    ctx.lineWidth = 1;
+
+    for (const [bearing, dist] of scan.points) {
+      const [x, y] = polar(cx, cy, bearing, dist > 0 ? dist : rangeMm, scale);
+      ctx.globalAlpha = dist > 0 ? 0.22 : 0.07;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawWalls(cx, cy, scale) {
+    const style = getComputedStyle(document.documentElement);
+    ctx.strokeStyle = style.getPropertyValue("--hit").trim();
+    ctx.lineWidth = 2;
+    ctx.globalAlpha = 0.55;
+
+    const pts = scan.points;
+
+    // Wrap around so the segment across 355 -> 0 is drawn too
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % pts.length];
+
+      if (a[1] <= 0 || b[1] <= 0) continue;
+      if (Math.abs(a[1] - b[1]) > WALL_JOIN_MM) continue;
+
+      const [x1, y1] = polar(cx, cy, a[0], a[1], scale);
+      const [x2, y2] = polar(cx, cy, b[0], b[1], scale);
+
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawPoints(cx, cy, scale) {
+    const style = getComputedStyle(document.documentElement);
+    ctx.fillStyle = style.getPropertyValue("--hit").trim();
+
+    for (const [bearing, dist] of scan.points) {
+      if (dist <= 0) continue;
+      const [x, y] = polar(cx, cy, bearing, dist, scale);
+      ctx.beginPath();
+      ctx.arc(x, y, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawRobot(cx, cy) {
+    const style = getComputedStyle(document.documentElement);
+    ctx.fillStyle = style.getPropertyValue("--accent").trim();
+
+    // Triangle pointing at 0 degrees - the robot's forward
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - 9);
+    ctx.lineTo(cx + 6, cy + 6);
+    ctx.lineTo(cx - 6, cy + 6);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // ----------------------------------------------------------
+  // stats panel
+  // ----------------------------------------------------------
+  function updateStats() {
+    if (!scan || scan.scan === null) {
+      ui.scan.textContent = ui.points.textContent = ui.hits.textContent =
+      ui.near.textContent = ui.far.textContent = ui.age.textContent = "—";
+      return;
+    }
+
+    const hits = scan.points.filter(p => p[1] > 0).map(p => p[1]);
+
+    ui.scan.textContent   = scan.scan;
+    ui.points.textContent = scan.points.length + (scan.steps ? " / " + scan.steps : "");
+    ui.hits.textContent   = hits.length;
+    ui.near.textContent   = hits.length ? Math.min(...hits) + " mm" : "—";
+    ui.far.textContent    = hits.length ? Math.max(...hits) + " mm" : "—";
+    ui.age.textContent    = scan.age_s + " s ago";
+  }
+
+  function setStatus(cls, text) {
+    ui.dot.className = cls;
+    ui.statusText.textContent = text;
+  }
+
+  // ----------------------------------------------------------
+  // polling
+  //
+  // Half a second: the robot produces a point roughly every 0.5 s
+  // while scanning, so this fills the map in as fast as it is
+  // actually being measured without hammering the server.
+  // ----------------------------------------------------------
+  async function poll() {
+    try {
+      const res = await fetch("/api/map", { cache: "no-store" });
+      if (!res.ok) throw new Error(res.status);
+
+      scan = await res.json();
+      failures = 0;
+
+      if (scan.scan === null) {
+        setStatus("", "no scan yet — press the robot's button or send 's'");
+      } else if (!scan.complete) {
+        setStatus("live", "scanning… " + scan.points.length +
+                          (scan.steps ? " / " + scan.steps : "") + " bearings");
+      } else if (scan.age_s > 120) {
+        setStatus("stale", "last scan " + Math.round(scan.age_s / 60) + " min ago");
+      } else {
+        setStatus("live", "scan complete — " + scan.hits + " obstacles");
+      }
+
+      updateStats();
+      draw();
+    } catch (err) {
+      failures++;
+      if (failures > 2) setStatus("down", "server unreachable");
+    }
+  }
+
+  // ----------------------------------------------------------
+  // wiring
+  // ----------------------------------------------------------
+  ui.zoom.addEventListener("input", () => {
+    ui.range.textContent = (Number(ui.zoom.value) / 1000).toFixed(1) + " m";
+    draw();
+  });
+
+  for (const box of [ui.walls, ui.rays, ui.labels]) {
+    box.addEventListener("change", draw);
+  }
+
+  ui.clear.addEventListener("click", async () => {
+    await fetch("/api/clear", { method: "POST" });
+    scan = null;
+    updateStats();
+    draw();
+    setStatus("", "cleared — waiting for the next scan");
+  });
+
+  window.addEventListener("resize", resize);
+
+  resize();
+  poll();
+  setInterval(poll, 500);
+})();
+</script>
+</body>
+</html>
